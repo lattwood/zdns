@@ -48,12 +48,14 @@ type TimedAnswer struct {
 
 type Cache struct {
 	IterativeCache cachehash.ShardedCacheHash
+	NoEDNSServers  cachehash.ShardedCacheHash
 	Stats          CacheStatistics
 }
 
 // Init initializes the cache with a maximum cacheSize.
 func (s *Cache) Init(cacheSize int) {
 	s.IterativeCache.Init(cacheSize, 4096)
+	s.NoEDNSServers.Init(cacheSize, 4096)
 }
 
 func (s *Cache) VerboseLog(depth int, args ...any) {
@@ -77,6 +79,37 @@ func (s *Cache) addCachedAnswer(q Question, nameServer string, isAuthority bool,
 		s.VerboseLog(depth+1, "inserting cache entry caused eviction, entry: ", q, " ", nameServer, " is authority: ", isAuthority)
 	} else {
 		s.VerboseLog(depth+1, "inserted new cache entry for ", q, " ", nameServer, " is authority: ", isAuthority, " ", result.Answers)
+	}
+
+	func (s *Cache) MarkNoEDNSServer(ns *NameServer, depth int) {
+		if ns == nil {
+			return
+		}
+		nameServer := ns.String()
+		if nameServer == "" {
+			return
+		}
+		s.NoEDNSServers.Lock(nameServer)
+		s.NoEDNSServers.Add(nameServer, true)
+		s.NoEDNSServers.Unlock(nameServer)
+		s.VerboseLog(depth+1, "marked nameserver as requiring no EDNS: ", nameServer)
+	}
+
+	func (s *Cache) IsNoEDNSServer(ns *NameServer, depth int) bool {
+		if ns == nil {
+			return false
+		}
+		nameServer := ns.String()
+		if nameServer == "" {
+			return false
+		}
+		s.NoEDNSServers.Lock(nameServer)
+		defer s.NoEDNSServers.Unlock(nameServer)
+		_, found := s.NoEDNSServers.Get(nameServer)
+		if found {
+			s.VerboseLog(depth+1, "nameserver requires no EDNS: ", nameServer)
+		}
+		return found
 	}
 	if didEject {
 		s.Stats.IncrementEjects()
