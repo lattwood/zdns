@@ -81,40 +81,41 @@ func (s *Cache) addCachedAnswer(q Question, nameServer string, isAuthority bool,
 		s.VerboseLog(depth+1, "inserted new cache entry for ", q, " ", nameServer, " is authority: ", isAuthority, " ", result.Answers)
 	}
 
-	func (s *Cache) MarkNoEDNSServer(ns *NameServer, depth int) {
-		if ns == nil {
-			return
-		}
-		nameServer := ns.String()
-		if nameServer == "" {
-			return
-		}
-		s.NoEDNSServers.Lock(nameServer)
-		s.NoEDNSServers.Add(nameServer, true)
-		s.NoEDNSServers.Unlock(nameServer)
-		s.VerboseLog(depth+1, "marked nameserver as requiring no EDNS: ", nameServer)
-	}
-
-	func (s *Cache) IsNoEDNSServer(ns *NameServer, depth int) bool {
-		if ns == nil {
-			return false
-		}
-		nameServer := ns.String()
-		if nameServer == "" {
-			return false
-		}
-		s.NoEDNSServers.Lock(nameServer)
-		defer s.NoEDNSServers.Unlock(nameServer)
-		_, found := s.NoEDNSServers.Get(nameServer)
-		if found {
-			s.VerboseLog(depth+1, "nameserver requires no EDNS: ", nameServer)
-		}
-		return found
-	}
 	if didEject {
 		s.Stats.IncrementEjects()
 	}
 	s.Stats.IncrementAdds()
+}
+
+func (s *Cache) MarkNoEDNSServer(ns *NameServer, depth int) {
+	if ns == nil {
+		return
+	}
+	nameServer := ns.String()
+	if nameServer == "" {
+		return
+	}
+	s.NoEDNSServers.Lock(nameServer)
+	s.NoEDNSServers.Add(nameServer, true)
+	s.NoEDNSServers.Unlock(nameServer)
+	s.VerboseLog(depth+1, "marked nameserver as requiring no EDNS: ", nameServer)
+}
+
+func (s *Cache) IsNoEDNSServer(ns *NameServer, depth int) bool {
+	if ns == nil {
+		return false
+	}
+	nameServer := ns.String()
+	if nameServer == "" {
+		return false
+	}
+	s.NoEDNSServers.Lock(nameServer)
+	defer s.NoEDNSServers.Unlock(nameServer)
+	_, found := s.NoEDNSServers.Get(nameServer)
+	if found {
+		s.VerboseLog(depth+1, "nameserver requires no EDNS: ", nameServer)
+	}
+	return found
 }
 
 func (s *Cache) GetCachedAuthority(authorityName string, ns *NameServer, depth int) (retv *SingleQueryResult, isFound bool) {
