@@ -63,6 +63,15 @@ func (mc MockLookupClient) DoDstServersLookup(ctx context.Context, r *Resolver, 
 	}
 }
 
+type countingRateLimiter struct {
+	waits *int32
+}
+
+func (l countingRateLimiter) wait(ctx context.Context, ns NameServer) error {
+	atomic.AddInt32(l.waits, 1)
+	return nil
+}
+
 func InitTest(t *testing.T) *ResolverConfig {
 	protocolStatus = make(map[nameAndIP]Status)
 	mockResults = make(map[nameAndIP]SingleQueryResult)
@@ -435,6 +444,136 @@ func TestParseEdnsAnswerNoEdns(t *testing.T) {
 	assert.Empty(t, ednsAnswer.Flags, "Unexpected EDNS Flags. Expected %v, got %v", 0, ednsAnswer.Flags)
 	assert.Nil(t, ednsAnswer.NSID, "Unexpected NSID string. Expected %v, got %v", nil, ednsAnswer.NSID)
 	assert.Empty(t, ednsAnswer.EDE, "Expected no EDE error code, got %v", ednsAnswer.EDE)
+}
+
+func TestFORMERRFallbackWithoutEDNS(t *testing.T) {
+	var totalQueries int32
+	var ednsQueries int32
+	var noEDNSQueries int32
+	var rateLimitWaits int32
+	nameServer, shutdown := startFORMERRNoEDNSTestServer(t, &totalQueries, &ednsQueries, &noEDNSQueries, true)
+	defer shutdown()
+
+	config := NewResolverConfig()
+	config.RateLimiter = countingRateLimiter{waits: &rateLimitWaits}
+	config.TransportMode = UDPOnly
+	config.IPVersionMode = IPv4Only
+	config.ShouldRecycleSockets = false
+	config.NetworkTimeout = time.Second
+	config.ExternalNameServersV4 = []NameServer{nameServer}
+	config.RootNameServersV4 = []NameServer{nameServer}
+
+	resolver, err := InitResolver(config)
+	require.NoError(t, err)
+
+	res, _, status, _, err := resolver.cachedLookup(context.Background(), Question{Name: "fallback.example", Type: dns.TypeA, Class: dns.ClassINET}, &nameServer, "fallback.example", 0, true, true, false, nil)
+	require.NoError(t, err)
+	require.Equal(t, StatusNoError, status)
+	require.Len(t, res.Answers, 1)
+	assert.Equal(t, int32(2), atomic.LoadInt32(&totalQueries))
+	assert.Equal(t, int32(1), atomic.LoadInt32(&ednsQueries))
+	assert.Equal(t, int32(1), atomic.LoadInt32(&noEDNSQueries))
+	assert.Equal(t, int32(2), atomic.LoadInt32(&rateLimitWaits))
+	assert.True(t, resolver.cache.IsNoEDNSServer(&nameServer, 0))
+
+	atomic.StoreInt32(&totalQueries, 0)
+	atomic.StoreInt32(&ednsQueries, 0)
+	atomic.StoreInt32(&noEDNSQueries, 0)
+	atomic.StoreInt32(&rateLimitWaits, 0)
+
+	_, _, status, _, err = resolver.cachedLookup(context.Background(), Question{Name: "remembered.example", Type: dns.TypeA, Class: dns.ClassINET}, &nameServer, "remembered.example", 0, true, true, false, nil)
+	require.NoError(t, err)
+	require.Equal(t, StatusNoError, status)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&totalQueries))
+	assert.Equal(t, int32(0), atomic.LoadInt32(&ednsQueries))
+	assert.Equal(t, int32(1), atomic.LoadInt32(&noEDNSQueries))
+	assert.Equal(t, int32(1), atomic.LoadInt32(&rateLimitWaits))
+}
+
+func TestFORMERRFallbackDoesNotRememberFailedNoEDNSRetry(t *testing.T) {
+	var totalQueries int32
+	var ednsQueries int32
+	var noEDNSQueries int32
+	nameServer, shutdown := startFORMERRNoEDNSTestServer(t, &totalQueries, &ednsQueries, &noEDNSQueries, false)
+	defer shutdown()
+
+	config := NewResolverConfig()
+	config.TransportMode = UDPOnly
+	config.IPVersionMode = IPv4Only
+	config.ShouldRecycleSockets = false
+	config.NetworkTimeout = time.Second
+	config.ExternalNameServersV4 = []NameServer{nameServer}
+	config.RootNameServersV4 = []NameServer{nameServer}
+
+	resolver, err := InitResolver(config)
+	require.NoError(t, err)
+
+	_, _, status, _, err := resolver.cachedLookup(context.Background(), Question{Name: "still-formerr.example", Type: dns.TypeA, Class: dns.ClassINET}, &nameServer, "still-formerr.example", 0, true, true, false, nil)
+	require.NoError(t, err)
+	require.Equal(t, StatusFormErr, status)
+	assert.Equal(t, int32(2), atomic.LoadInt32(&totalQueries))
+	assert.Equal(t, int32(1), atomic.LoadInt32(&ednsQueries))
+	assert.Equal(t, int32(1), atomic.LoadInt32(&noEDNSQueries))
+	assert.False(t, resolver.cache.IsNoEDNSServer(&nameServer, 0))
+
+	atomic.StoreInt32(&totalQueries, 0)
+	atomic.StoreInt32(&ednsQueries, 0)
+	atomic.StoreInt32(&noEDNSQueries, 0)
+
+	_, _, status, _, err = resolver.cachedLookup(context.Background(), Question{Name: "still-formerr-again.example", Type: dns.TypeA, Class: dns.ClassINET}, &nameServer, "still-formerr-again.example", 0, true, true, false, nil)
+	require.NoError(t, err)
+	require.Equal(t, StatusFormErr, status)
+	assert.Equal(t, int32(2), atomic.LoadInt32(&totalQueries))
+	assert.Equal(t, int32(1), atomic.LoadInt32(&ednsQueries))
+	assert.Equal(t, int32(1), atomic.LoadInt32(&noEDNSQueries))
+}
+
+func startFORMERRNoEDNSTestServer(t *testing.T, totalQueries, ednsQueries, noEDNSQueries *int32, noEDNSSucceeds bool) (NameServer, func()) {
+	t.Helper()
+
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	server := &dns.Server{
+		PacketConn: conn,
+		Handler: dns.HandlerFunc(func(w dns.ResponseWriter, req *dns.Msg) {
+			atomic.AddInt32(totalQueries, 1)
+			resp := new(dns.Msg)
+			if req.IsEdns0() != nil {
+				atomic.AddInt32(ednsQueries, 1)
+				resp.SetRcode(req, dns.RcodeFormatError)
+			} else if !noEDNSSucceeds {
+				atomic.AddInt32(noEDNSQueries, 1)
+				resp.SetRcode(req, dns.RcodeFormatError)
+			} else {
+				atomic.AddInt32(noEDNSQueries, 1)
+				resp.SetReply(req)
+				resp.Answer = []dns.RR{
+					&dns.A{
+						Hdr: dns.RR_Header{
+							Name:   req.Question[0].Name,
+							Rrtype: dns.TypeA,
+							Class:  dns.ClassINET,
+							Ttl:    60,
+						},
+						A: net.ParseIP("192.0.2.1"),
+					},
+				}
+			}
+			require.NoError(t, w.WriteMsg(resp))
+		}),
+	}
+
+	go func() {
+		if serveErr := server.ActivateAndServe(); serveErr != nil {
+			assert.ErrorIs(t, serveErr, net.ErrClosed)
+		}
+	}()
+
+	addr := conn.LocalAddr().(*net.UDPAddr)
+	return NameServer{IP: net.ParseIP("127.0.0.1"), Port: uint16(addr.Port)}, func() {
+		assert.NoError(t, server.Shutdown())
+	}
 }
 
 func TestParseEdnsAnswerEDE1(t *testing.T) {
