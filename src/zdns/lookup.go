@@ -914,23 +914,37 @@ func (r *Resolver) cachedLookup(ctx context.Context, q Question, nameServer *Nam
 	}
 
 	if status == StatusFormErr && useEDNS {
-		r.cache.MarkNoEDNSServer(nameServer, depth+2)
+		fallbackLookupCtx, fallbackCancel := context.WithTimeout(ctx, r.networkTimeout)
+		defer fallbackCancel()
+		err = r.rateLimit.wait(fallbackLookupCtx, *nameServer)
+		if err != nil {
+			return &SingleQueryResult{}, false, StatusError, trace, fmt.Errorf("rate limiter error for nameserver %s: %w", nameServer, err)
+		}
 		if r.dnsOverHTTPSEnabled {
 			r.verboseLog(depth, "****WIRE LOOKUP WITHOUT EDNS*** ", DoHProtocol, " ", dns.TypeToString[q.Type], " ", q.Name, " ", nameServer)
-			result, rawResp, status, err = doDoHLookup(lookupCtx, connInfo.httpsClient, q, nameServer, requestIteration, r.ednsOptions, r.dnsSecEnabled, r.checkingDisabledBit, false)
+			result, rawResp, status, err = doDoHLookup(fallbackLookupCtx, connInfo.httpsClient, q, nameServer, requestIteration, r.ednsOptions, r.dnsSecEnabled, r.checkingDisabledBit, false)
 		} else if r.dnsOverTLSEnabled {
 			r.verboseLog(depth, "****WIRE LOOKUP WITHOUT EDNS*** ", DoTProtocol, " ", dns.TypeToString[q.Type], " ", q.Name, " ", nameServer)
-			result, rawResp, status, err = doDoTLookup(lookupCtx, connInfo, q, nameServer, r.rootCAs, r.verifyServerCert, requestIteration, r.ednsOptions, r.dnsSecEnabled, r.checkingDisabledBit, false)
+			result, rawResp, status, err = doDoTLookup(fallbackLookupCtx, connInfo, q, nameServer, r.rootCAs, r.verifyServerCert, requestIteration, r.ednsOptions, r.dnsSecEnabled, r.checkingDisabledBit, false)
 		} else if connInfo.udpClient != nil {
 			r.verboseLog(depth, "****WIRE LOOKUP WITHOUT EDNS*** ", UDPProtocol, " ", dns.TypeToString[q.Type], " ", q.Name, " ", nameServer)
-			result, rawResp, status, err = wireLookupUDP(lookupCtx, connInfo, q, nameServer, r.ednsOptions, requestIteration, r.dnsSecEnabled, r.checkingDisabledBit, false)
+			result, rawResp, status, err = wireLookupUDP(fallbackLookupCtx, connInfo, q, nameServer, r.ednsOptions, requestIteration, r.dnsSecEnabled, r.checkingDisabledBit, false)
 			if status == StatusTruncated && connInfo.tcpClient != nil {
 				r.verboseLog(depth, "****WIRE LOOKUP WITHOUT EDNS*** ", TCPProtocol, " ", dns.TypeToString[q.Type], " ", q.Name, " ", nameServer)
-				result, rawResp, status, err = wireLookupTCP(lookupCtx, connInfo, q, nameServer, r.ednsOptions, requestIteration, r.dnsSecEnabled, r.checkingDisabledBit, false)
+				result, rawResp, status, err = wireLookupTCP(fallbackLookupCtx, connInfo, q, nameServer, r.ednsOptions, requestIteration, r.dnsSecEnabled, r.checkingDisabledBit, false)
 			}
 		} else if connInfo.tcpClient != nil {
 			r.verboseLog(depth, "****WIRE LOOKUP WITHOUT EDNS*** ", TCPProtocol, " ", dns.TypeToString[q.Type], " ", q.Name, " ", nameServer)
-			result, rawResp, status, err = wireLookupTCP(lookupCtx, connInfo, q, nameServer, r.ednsOptions, requestIteration, r.dnsSecEnabled, r.checkingDisabledBit, false)
+			result, rawResp, status, err = wireLookupTCP(fallbackLookupCtx, connInfo, q, nameServer, r.ednsOptions, requestIteration, r.dnsSecEnabled, r.checkingDisabledBit, false)
+		}
+		fallbackReturnedDNSResponse := err == nil &&
+			status != StatusFormErr &&
+			status != StatusError &&
+			status != StatusTimeout &&
+			status != StatusIterTimeout &&
+			status != StatusTruncated
+		if fallbackReturnedDNSResponse {
+			r.cache.MarkNoEDNSServer(nameServer, depth+2)
 		}
 	}
 
